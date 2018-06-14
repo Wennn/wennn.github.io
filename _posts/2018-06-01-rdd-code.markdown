@@ -1,0 +1,255 @@
+---
+layout: post
+title:  "RDD代码笔记（第一部分）"
+date:   2018-06-14 21:00:00 +0800
+categories: spark
+---
+## 背景
+&emsp;&emsp;
+RDD（Resilient Distributed Dataset）是Spark计算时最基础的数据结构，表示一个能够被并行操作的、不可变的、分区的元素集合。众所周知，Spark的一个重要特点就是内存计算（in-memory computation）。在UCB于2012年发表的[论文](http://people.csail.mit.edu/matei/papers/2012/nsdi_spark.pdf)中，作者认为RDD是迭代算法（iterative algorithms）等场景下内存计算以及有效容错的基础。  
+本文将以Spark当前branch-2.3的代码为基础，对*RDD.scala*代码作出笔记。
+
+## RDD概述
+&emsp;&emsp;
+在*RDD.scala*中，RDD被声明为抽象类（abstract class）。在Spark计算过程中，会根据计算过程生成HadoopRDD、MapPartitionsRDD等不同类型的RDD。而抽象类RDD则作为它们的公共父类，定义了map、filter、persist等可以作用在所有RDD上的基本操作，以及每种RDD所应具有的基本属性。这些属性包括：
+- partitions的list   
+&emsp;&emsp;
+RDD都由若干个partition构成，每一个partition代表了一个分区的数据。partition自身更多的是一种逻辑概念，它仅代表了一个分区的数据，而其对应的数据则通过该分区的迭代器Iterator获取。
+- 计算每一个partition的方法  
+&emsp;&emsp;
+如上所述，spark会通过Iterator来获取partition所代表的分区数据。当我们无法从缓存或checkpoint等地方直接获取到迭代器时，就需要通过这一计算方法来计算得到。下文中会提到，抽象类RDD中并没有给出compute的实现逻辑，而是交由不同子类分别具体实现。
+- 对于其它RDD的依赖（dependencies）  
+&emsp;&emsp;
+了解spark的计算过程就知道，在action之前，spark的执行过程就是RDD的转换过程。因此，每个RDD也就需要保存自身是由哪些RDD转换得到，也就是所谓的依赖。
+- 对于key-value类型的RDD，还会有分区器（partitioner）  
+&emsp;&emsp;
+众所周知RDD是一种分布式存储模型，那么分区器则决定了RDD的每一条记录将归属于哪一块儿分区。需要注意的是，只有key-value类型的RDD才会有分区器。对于非key-value类型的RDD，其分区归属则取决于数据源（例如HDFS的block）或者父RDD的处理结果。
+- 有些RDD还会有partition所对应的优先位置（preferred locations）  
+&emsp;&emsp;
+例如，HDFS文件的block的位置就会是RDD每个partition的优先位置。但是，并不是每个RDD都有这一属性。
+
+&emsp;&emsp;
+接下来，本文将对*RDD.scala*的代码进行简单的介绍。
+
+## RDD代码走读
+&emsp;&emsp;
+*RDD.scala*中包含了abstract class RDD的以及一个伴生对象object RDD。
+
+&emsp;&emsp;
+接下来先来看虚拟类的定义。
+
+```scala
+abstract class RDD[T: ClassTag](
+    @transient private var _sc: SparkContext,
+    @transient private var deps: Seq[Dependency[_]]
+  ) extends Serializable with Logging
+```
+&emsp;&emsp;
+RDD的构造函数中包含两个参数：SparkContext类型的_sc与Seq[Dependency[_]]类型的deps，且均被private var修饰并添加了@transient注解。其中，SparkContext是Spark程序的入口。deps则是上文中提到的依赖关系，由于每一个RDD可能依赖不止一个其它RDD，因此传入的是一个Seq类型。@transient注解则标志着这两个参数并不会随着对象一起被序列化。
+```scala
+if (classOf[RDD[_]].isAssignableFrom(elementClassTag.runtimeClass)) {
+  // This is a warning instead of an exception in order to avoid breaking user programs that
+  // might have defined nested RDDs without running jobs with them.
+  logWarning("Spark does not support nested RDDs (see SPARK-5063)")
+}
+```
+&emsp;&emsp;
+这段代码的含义比较直接，就是当发现嵌套的RDD时，丢出一个警告。判断条件中的elementClassTag是RDD的spark包内私有方法，用以返回当前RDD所持有元素类型的ClassTag。众所周知，Java在实现泛型时会将类型擦除，而Scala就是通过ClassTag来保存并可通过runtimeClass字段获得被擦除的类型。那么判断逻辑就很直接了，当RDD持有的元素类型是RDD或RDD的子类时，则被认为是嵌套。
+```scala
+private def sc: SparkContext = {
+  if (_sc == null) {
+    throw new SparkException(
+      "This RDD lacks a SparkContext. It could happen in the following cases: \n(1) RDD " +
+      "transformations and actions are NOT invoked by the driver, but inside of other " +
+      "transformations; for example, rdd1.map(x => rdd2.values.count() * x) is invalid " +
+      "because the values transformation and count action cannot be performed inside of the " +
+      "rdd1.map transformation. For more information, see SPARK-5063.\n(2) When a Spark " +
+      "Streaming job recovers from checkpoint, this exception will be hit if a reference to " +
+      "an RDD not defined by the streaming job is used in DStream operations. For more " +
+      "information, See SPARK-13758.")
+  }
+    _sc
+}
+```
+&emsp;&emsp;
+sc被声明为私有成员方法，用以获得当前RDD的SparkContext对象_sc。如果_sc为空时会丢出SparkException。异常信息中则列举了可能出现SparkContext缺失的场景。
+
+```scala
+def this(@transient oneParent: RDD[_]) =
+  this(oneParent.context, List(new OneToOneDependency(oneParent)))
+```
+&emsp;&emsp;
+这一段实现了以RDD作为参数的辅助构造函数。实现逻辑很简单，就是将父RDD的context以及一个基于父RDD的
+OneToOneDependency丢到List中传入主构造函数。
+```scala
+private[spark] def conf = sc.conf
+```
+&emsp;&emsp;
+conf用来返回SparkContext对象中的SparkConf成员。SparkConf用以保存Spark应用的各项配置，主要的成员是一个名为settings的ConcurrentHashMap[String, String]对象。
+```scala
+@DeveloperApi
+def compute(split: Partition, context: TaskContext): Iterator[T]
+```
+&emsp;&emsp;
+这也就是上文提到的用以计算每一个分区的compute方法。注释也提到，这一方法交由各个子类来具体实现。  
+compute方法有两个参数，名为split的Partition类型以及名为context的TaskContext类型对象。其中，split就是所要计算的分区数据；TaskContext顾名思义就是task的上下文，这个类中保存了task的执行元数据如stageId（该task所属的stage的ID）、partitionId（该task所计算的RDD partition ID），执行状态如isCompleted（task是否完成）、isInterrupted（task是否被kill）等，除此之外还保存了在任务完成、失败等状态下的listener，也就是回调函数。例如，HadoopRDD就会通过TaskContext的addTaskCompletionListener注册一个关闭输入流的回调函数。  
+&emsp;&emsp;
+compute方法的返回类型是Iterator[T]，也就是真正持有对象数据的类型。  
+&emsp;&emsp;
+不同类型RDD计算方式的区别根本上就是compute实现的差异。  
+&emsp;&emsp;
+例如，在MapPartitionsRDD中，compute的实现是这样的：
+```scala
+override def compute(split: Partition, context: TaskContext): Iterator[U] =
+  f(context, split.index, firstParent[T].iterator(split, context))
+```
+&emsp;&emsp;
+而在CartesianRDD中，compute的实现则是这样的：
+```scala
+override def compute(split: Partition, context: TaskContext): Iterator[(T, U)] = {
+  val currSplit = split.asInstanceOf[CartesianPartition]
+  for (x <- rdd1.iterator(currSplit.s1, context);
+       y <- rdd2.iterator(currSplit.s2, context)) yield (x, y)
+  }
+```
+&emsp;&emsp;
+MapPartitionsRDD也就是map方法生成的RDD，其计算方法也就是通过调用map方法时传入的函数对象进行计算。而CartesianRDD则是调用cartesian方法时生成的RDD，其计算逻辑也很简单，就是分别遍历输入的两个RDD的所有元素，全部两两组合，来构造笛卡尔积的运算关系。  
+```scala
+/**
+ * Implemented by subclasses to return the set of partitions in this RDD. This method will only
+ * be called once, so it is safe to implement a time-consuming computation in it.
+ *
+ * The partitions in this array must satisfy the following property:
+ *   `rdd.partitions.zipWithIndex.forall { case (partition, index) => partition.index == index }`
+ */
+protected def getPartitions: Array[Partition]
+```
+```scala
+/**
+ * Implemented by subclasses to return how this RDD depends on parent RDDs. This method will only
+ * be called once, so it is safe to implement a time-consuming computation in it.
+ */
+protected def getDependencies: Seq[Dependency[_]] = deps
+```
+&emsp;&emsp;
+接下来两个方法，分别用来返回Partition数组和依赖关系。不过，这两个方法并不是Java习惯下的getter方法（Scala中好像很少采用getXXX作为作为getter命名。就像[Effective Scala](http://twitter.github.io/effectivescala/index-cn.html)中写的：“getters不采用前缀get：用get是多余的: site.count而非site.getCount”），而正如注释中所提到的，这两个方法仅仅会被调用一次。具体调用的位置与具体细节将会在下文中提到。
+```scala
+protected def getPreferredLocations(split: Partition): Seq[String] = Nil
+```
+&emsp;&emsp;
+如上文所提到的，这个方法就是返回所谓的优先位置（prefered locations），返回结果是一个String的Seq。例如在HadoopRDD中就是返回相应的host信息。
+```scala
+@transient val partitioner: Option[Partitioner] = None
+```
+&emsp;&emsp;
+分区器，用来决定RDD是如何被划分的，默认为None值。
+```scala
+def sparkContext: SparkContext = sc
+```
+&emsp;&emsp;
+调用了前述的private权限的sc方法，用来返回创建了该RDD的SparkContext，也就是构造函数传进来的_sc对象。
+```scala
+val id: Int = sc.newRddId()
+```
+&emsp;&emsp;
+顾名思义，是这个RDD的unique id，由SparkContext的newRddId方法生成。在SparkContext中存有一个私有不可变的名为nextRddId的AtomicInteger对象，newRddId方法就是调用这个对象的getAndIncrement方法。
+```scala
+/** A friendly name for this RDD */
+@transient var name: String = _
+
+/** Assign a name to this RDD */
+def setName(_name: String): this.type = {
+  name = _name
+  this
+}
+```
+&emsp;&emsp;
+如注释所言，RDD也是可以有名字的。而且，不同于大多数成员，name还是一个可变的对象（var）。需要注意的是，name前也有@transient注解，因此它不会被序列化并传给下一个使用的对象。初始化时的下划线_等同于Java中将该变量初始化为null，这种用法仅可对类成员使用。
+```scala
+/**
+ * Mark this RDD for persisting using the specified level.
+ *
+ * @param newLevel the target storage level
+ * @param allowOverride whether to override any existing level with the new one
+ */
+private def persist(newLevel: StorageLevel, allowOverride: Boolean): this.type = {
+  // TODO: Handle changes of StorageLevel
+  if (storageLevel != StorageLevel.NONE && newLevel != storageLevel && !allowOverride) {
+    throw new UnsupportedOperationException(
+      "Cannot change storage level of an RDD after it was already assigned a level")
+  }
+  // If this is the first time this RDD is marked for persisting, register it
+  // with the SparkContext for cleanups and accounting. Do this only once.
+  if (storageLevel == StorageLevel.NONE) {
+    sc.cleaner.foreach(_.registerRDDForCleanup(this))
+    sc.persistRDD(this)
+  }
+  storageLevel = newLevel
+  this
+}
+``` 
+&emsp;&emsp;
+RDD的持久化是Spark提供的提高计算效率的重要特性。用户可以通过在代码中显式地调用cache()或persist()（并非此处的persist）方法来持久化某一RDD，使其可以被之后的操作复用而避免了每次都从头计算的开销。此处贴出的是被声明为private的persist方法。按照Spark的风格，这个方法为给用户使用的持久化方法提供了具体实现逻辑。  
+&emsp;&emsp;
+这个方法接受两个参数，名为newLevel的StorageLevel对象以及一个allowOverride的布尔对象。从参数名不难看出，Spark提供了对于RDD持久化等级的修改的支持，但是需要额外一个布尔值的控制。同时，由于这是一个private方法，那么StorageLevel的可修改场景肯定是由该方法的上层调用所控制。而具体实现也证实了这个想法。  
+&emsp;&emsp;
+StorageLevel是Spark用来定义、管理RDD存储级别的类，此处暂不展开说明。那么，当RDD当前的存储级别不为NONE（即不落盘、不使用内存、不使用堆外内存、不反序列化）且newLevel与当前的storageLevel不相同且allowOverride为false时，该方法就会抛出一个UnsupportedOperationException。  
+&emsp;&emsp;
+如果当前RDD的存储级别为NONE，也就是第一次要被标记持久化时，Spark会首首先通过SparkContext对象中名为cleaner的ContextCleaner对象，将其注册到一个名为referenceBuffer的Set之中；之后再调用SparkContext的persistRDD方法，将该RDD添加到一个名为persistentRdds的ConcurrentMap当中。这一系列操作意味着该RDD被SparkContext正式接纳为被persist的RDD的一份子。SparkContext通过一个Map记录了“申请”了persist的RDD名单，并基于JVM的WeakReference机制，通过ContextCleaner确保持久化的RDD可以得到正确的垃圾回收处理。这一系列类似“新生入学”的操作仅会执行一次。  
+&emsp;&emsp;
+之后将newLevel赋值给storageLevel，并返回this即完成了persist操作。
+```scala
+/**
+ * Set this RDD's storage level to persist its values across operations after the first time
+ * it is computed. This can only be used to assign a new storage level if the RDD does not
+ * have a storage level set yet. Local checkpointing is an exception.
+ */
+def persist(newLevel: StorageLevel): this.type = {
+  if (isLocallyCheckpointed) {
+    // This means the user previously called localCheckpoint(), which should have already
+    // marked this RDD for persisting. Here we should override the old storage level with
+    // one that is explicitly requested by the user (after adapting it to use disk).
+    persist(LocalRDDCheckpointData.transformStorageLevel(newLevel), allowOverride = true)
+  } else {
+    persist(newLevel, allowOverride = false)
+  }
+}
+```
+&emsp;&emsp;
+这一个persist方法是15年8月新修改的方法。而上述persist提到的allowOverride参数也是为了配合这个方法一并提交的。这一次提交增加了对于RDD的local checkpointing的支持，而这一新增加的persist逻辑以及allowOverride参数都是为了配合local checkpointing而做出的特殊处理。  
+&emsp;&emsp;
+此处persist的逻辑就是如果RDD已经执行过localCheckpoint方法，那么Spark会在保留使用磁盘（即useDisk为true）的基础上加入用户新声明的StorageLevel的其它配置（内存、堆外内存、反序列化）构成一个新的StorageLevel，连同allowOverride一起传入上述的persist方法中，等同于在落盘之外，加入了用户关于内存、反序列化等的配置。否则，如果RDD在此之前没有执行过localCheckpoint，那么就正常传入用户传进来的StorageLevel，同时如果已执行过持久化，那么不允许覆盖已有的StorageLevel，这就与加入localCheckpoint之前的persist行为一致了。
+```scala
+/**
+ * Persist this RDD with the default storage level (`MEMORY_ONLY`).
+ */
+def persist(): this.type = persist(StorageLevel.MEMORY_ONLY)
+
+/**
+ * Persist this RDD with the default storage level (`MEMORY_ONLY`).
+ */
+def cache(): this.type = persist()
+```
+&emsp;&emsp;
+这两个方法连同上面的persist(newLevel: StorageLevel)就是给用户使用的持久化方法。如同注释所言，在用户不显式地指定StorageLevel时，默认的存储级别就是所谓的“MEMORY_ONLY”，仅反序列化的保存在内存中。
+```scala
+/**
+ * Mark the RDD as non-persistent, and remove all blocks for it from memory and disk.
+ *
+ * @param blocking Whether to block until all blocks are deleted.
+ * @return This RDD.
+ */
+def unpersist(blocking: Boolean = true): this.type = {
+  logInfo("Removing RDD " + id + " from persistence list")
+  sc.unpersistRDD(id, blocking)
+  storageLevel = StorageLevel.NONE
+  this
+}
+```
+&emsp;&emsp;
+unpersist方法逻辑很简单，其功能如同备注所述，就是将该RDD的StorageLevel置为NONE，并从内存和硬盘当中将所有缓存数据删除。名为blocking的布尔值用来控制是否等待删除完成。
+## 未完待续
+&emsp;&emsp;
+以上笔记主要是对Spark 2.3.0版本RDD.scala文件前220行代码简单记录。RDD.scala文件最后一个大括号位于1894行。完成一份完整的笔记仍然需要继续努力。总体来看，RDD的设计贴合了其惰性计算的主旨，代码更多地关注于实现逻辑，并通过意义明显的方法名、变量名使得执行思路一目了然。而具体实现则交由SparkContext等对关联对象来具体执行。  
+&emsp;&emsp;
+如果您有任何建议或看法，十分欢迎您通过[Github Issues](https://github.com/Wennn/wennn.github.io/issues)为我指正。
