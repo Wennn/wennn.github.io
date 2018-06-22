@@ -4,12 +4,12 @@ title:  "RDD代码笔记（第一部分）"
 date:   2018-06-14 21:00:00 +0800
 categories: spark
 ---
-## 背景
+### 背景
 &emsp;&emsp;
 RDD（Resilient Distributed Dataset）是Spark计算时最基础的数据结构，表示一个能够被并行操作的、不可变的、分区的元素集合。众所周知，Spark的一个重要特点就是内存计算（in-memory computation）。在UCB于2012年发表的[论文](http://people.csail.mit.edu/matei/papers/2012/nsdi_spark.pdf)中，作者认为RDD是迭代算法（iterative algorithms）等场景下内存计算以及有效容错的基础。  
 本文将以Spark当前branch-2.3的代码为基础，对*RDD.scala*代码作出笔记。
 
-## RDD概述
+### RDD概述
 &emsp;&emsp;
 在*RDD.scala*中，RDD被声明为抽象类（abstract class）。在Spark计算过程中，会根据计算过程生成HadoopRDD、MapPartitionsRDD等不同类型的RDD。而抽象类RDD则作为它们的公共父类，定义了map、filter、persist等可以作用在所有RDD上的基本操作，以及每种RDD所应具有的基本属性。这些属性包括：
 - partitions的list   
@@ -31,7 +31,7 @@ RDD都由若干个partition构成，每一个partition代表了一个分区的�
 &emsp;&emsp;
 接下来，本文将对*RDD.scala*的代码进行简单的介绍。
 
-## RDD代码走读
+### RDD代码走读
 &emsp;&emsp;
 *RDD.scala*中包含了abstract class RDD的以及一个伴生对象object RDD。
 
@@ -248,7 +248,7 @@ def unpersist(blocking: Boolean = true): this.type = {
 ```
 &emsp;&emsp;
 unpersist方法逻辑很简单，其功能如同备注所述，就是将该RDD的StorageLevel置为NONE，并从内存和硬盘当中将所有缓存数据删除。名为blocking的布尔值用来控制是否等待删除完成。
-## 未完待续
+### 未完待续
 &emsp;&emsp;
 以上笔记主要是对Spark 2.3.0版本RDD.scala文件前220行代码简单记录。RDD.scala文件最后一个大括号位于1894行。完成一份完整的笔记仍然需要继续努力。总体来看，RDD的设计贴合了其惰性计算的主旨，代码更多地关注于实现逻辑，并通过意义明显的方法名、变量名使得执行思路一目了然。而具体实现则交由SparkContext等对关联对象来具体执行。  
 &emsp;&emsp;

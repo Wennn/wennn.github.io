@@ -1,0 +1,17 @@
+---
+layout: default
+---
+<div id="banner">
+  <h1 class="title">{{ page.title | escape }}</h1>
+  {% if page.date %}
+  <span class="sub_info">{{ page.date | date_to_string }}</span>
+  {% endif %}
+</div>
+
+<div class="post">
+  <div class="content">
+    {{ content }}
+  </div>
+
+</div>
+</div>
