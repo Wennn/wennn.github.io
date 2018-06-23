@@ -28,6 +28,6 @@ public int solution(int[] nums) {
 
 ### 结语
 &emsp;&emsp;
-这道题目同样是一道非常基础的题目。只要能想到异或这一技巧，编码便会非常简单。  
+这道题目同样是一道非常基础的题目。只要能想到异或这一技巧，编码就非常简单了。  
 &emsp;&emsp;
 如果您有任何建议或看法，十分欢迎您通过[Github Issues](https://github.com/Wennn/wennn.github.io/issues)为我指正。
